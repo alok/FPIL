@@ -31,6 +31,36 @@ deriving instance Repr for InputFlag, ParseError.Kind
 instance : ToString ParseError :=
   ⟨fun err => s!"{repr err.kind}"⟩
 
+/-- A monadic action. Just a map `Config → IO α` -/
+abbrev ConfigIO (α) := Config → IO α
+
+/--Lifts a pure value into the ConfigIO monad by ignoring the config -/
+def liftPure (a : α) : ConfigIO α := fun _ => pure a
+
+/--This is a monad because it has a pure and bind function-/
+instance : Monad ConfigIO where
+  /- Pure ignores the config-/
+  pure := liftPure
+  /- Bind takes a config and a function that takes a config and returns an IO action, and returns an IO action-/
+  bind result next := fun cfg => do
+    let newConfig  <- result cfg
+    next newConfig cfg
+
+def ConfigIO.run (cfg:Config)(action: ConfigIO α):IO α := action cfg
+
+/--Returns the current config-/
+def currentConfig : ConfigIO Config := pure
+
+/--Locally changes the config for the duration of the action-/
+def locally (change :Config->Config) (action: ConfigIO α) : ConfigIO α:=
+  fun cfg =>
+    let newCfg := change cfg
+    action newCfg
+
+/--Runs an IO action ignoring the config and returns the result in the ConfigIO monad-/
+def runIO (action: IO α) : ConfigIO α := fun _ =>
+  action
+
 /--
   Extract the base name from a file path as an optional FileEntry.
   Returns none when the basename is "." or "..".
@@ -70,35 +100,33 @@ def Config.dirName (cfg : Config) (dir : String) : String := s!"{cfg.currPrefix}
 /--
   Prints a file entry using the configured display style.
 -/
-def Config.showFileName (cfg : Config) (file : String) : IO Unit := do
-  IO.println (cfg.fileName file)
+def showFileName  (file : String) : ConfigIO Unit := do
+  runIO (IO.println ((←currentConfig).fileName file))
 
 /--
   Prints a directory entry using the configured display style.
 -/
-def Config.showDirName (cfg : Config) (dir : String) : IO Unit := do
-  IO.println (cfg.dirName dir)
-
-/--
-  Prints a file's name from its file path using the configuration's marker style.
--/
-def Config.showfile (cfg : Config) (path : System.FilePath) : IO Unit :=
-  IO.println (cfg.fileName path.fileName.get!)
-
+def showDirName (dir : String) : ConfigIO Unit := do
+  runIO (IO.println ((←currentConfig).dirName dir))
+def doList [Applicative f] : List α → (α → f Unit) → f Unit
+  | [], _ => pure ()
+  | x :: xs, action =>
+    action x *>
+    doList xs action
 /--
   Recursively prints the directory tree starting from the given path.
 -/
-partial def dirTree (cfg : Config) (path : System.FilePath) : IO Unit := do
-  match (← toEntry path) with
-  | some (.file name) =>
-      cfg.showFileName name
-  | some (.dir name)  =>
-      cfg.showDirName name
-      let newCfg := cfg.withDir
-      for c in (← path.readDir) do
-        dirTree newCfg c.path
+partial def dirTree (path : System.FilePath) : ConfigIO Unit := do
+  match (← runIO (toEntry path)) with
   | none =>
-      return ()
+    return ()
+  | some (.file name) =>
+      showFileName name
+  | some (.dir name)  =>
+      showDirName name
+      let newCfg := (←currentConfig).withDir
+      let contents ← runIO (path.readDir)
+      locally (·.withDir) (doList contents.toList (dirTree ·.path))
 
 /--
   Executes the 'doug' command by parsing CLI flags and printing the rendering mode.
@@ -106,7 +134,7 @@ partial def dirTree (cfg : Config) (path : System.FilePath) : IO Unit := do
 def runDoug (parsed : Parsed) : IO UInt32 := do
   let ascii? := parsed.flag! "ascii" |>.as! Bool
   let cfg : Config := { unicode? := not ascii? }
-  dirTree cfg (← IO.currentDir)
+  (dirTree (← IO.currentDir)).run cfg
   if cfg.unicode? then
     IO.println "Rendering directory tree with Unicode characters"
   else
@@ -135,6 +163,7 @@ def main (args : List String := ["--ascii", "false"]) : IO UInt32 := do
       IO.eprintln s!"{err}"
       return 1
 
-#eval main
+#eval main 
 
 end Doug
+#synth ToString Char
